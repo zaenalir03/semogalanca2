@@ -69,23 +69,22 @@ def make_concat_playlist(video_paths):
 
 
 def resolve_youtube_live_url(source_url, log_callback):
-    """Ambil URL media live yang bisa dibaca FFmpeg.
+    """Resolve a YouTube live page to a direct HLS/live media URL."""
+    source_url = source_url.strip()
+    if not source_url.startswith(("https://www.youtube.com/", "https://youtube.com/", "https://youtu.be/")):
+        raise RuntimeError("URL sumber harus berupa URL YouTube yang valid.")
 
-    Untuk live YouTube, prioritaskan format HLS/muxed agar video dan audio
-    sumber tersedia dalam satu input. URL hasil yt-dlp bersifat sementara,
-    jadi fungsi ini dipanggil ulang jika FFmpeg gagal membuka sumber.
-    """
+    # Live HLS lebih stabil untuk input FFmpeg daripada memilih 'best' biasa.
     format_candidates = [
-        "best[protocol*=m3u8][height<=720]",
-        "best[protocol*=m3u8]",
-        "best[height<=720]",
+        "bestaudio*+bestvideo*[protocol=m3u8]/best[protocol=m3u8]",
+        "best[protocol=m3u8]",
         "best",
     ]
     last_error = ""
     for fmt in format_candidates:
         try:
             result = subprocess.run(
-                [sys.executable, "-m", "yt_dlp", "--no-warnings", "-f", fmt, "-g", source_url],
+                [sys.executable, "-m", "yt_dlp", "--no-warnings", "--live-from-start", "-f", fmt, "-g", source_url],
                 capture_output=True,
                 text=True,
                 timeout=90,
@@ -93,21 +92,20 @@ def resolve_youtube_live_url(source_url, log_callback):
             )
             urls = [line.strip() for line in result.stdout.splitlines() if line.strip()]
             if urls:
-                # Jika yt-dlp memberi lebih dari satu URL (mis. video+audio),
-                # pilih URL pertama yang berupa manifest HLS atau URL muxed.
+                # Jangan memilih sembarang URL kedua. Untuk live, satu URL manifest
+                # HLS biasanya sudah memuat audio+video.
                 direct_url = next((u for u in urls if ".m3u8" in u.lower()), urls[0])
-                log_callback(f"Sumber live berhasil di-resolve ({fmt}).")
+                log_callback(f"Sumber live berhasil di-resolve dengan format: {fmt}")
                 return direct_url
         except subprocess.CalledProcessError as e:
-            last_error = (e.stderr or e.stdout or "").strip()[-1500:]
+            last_error = (e.stderr or e.stdout or "").strip()[-2000:]
         except Exception as e:
             last_error = str(e)
 
     raise RuntimeError(
-        "Gagal mengambil media live dari YouTube. "
-        + (last_error or "Format live tidak tersedia.")
+        "Gagal mengambil stream live sumber. Pastikan URL adalah live yang sedang aktif "
+        "dan dapat diakses tanpa login. " + (last_error or "Tidak ada format live yang tersedia.")
     )
-
 
 
 def make_audio_playlist(audio_paths):
@@ -119,10 +117,14 @@ def make_audio_playlist(audio_paths):
             f.write(f"file '{p}'\n")
     return str(playlist)
 
-def run_ffmpeg(mode, video_paths, audio_paths, source_url, stream_key, is_shorts, loop_playlist, log_callback):
+def run_ffmpeg(mode, video_paths, audio_paths, source_url, stream_key, ingest_protocol, is_shorts, loop_playlist, log_callback):
     global FFMPEG_PROCESS
 
-    output_url = f"rtmp://a.rtmp.youtube.com/live2/{stream_key}"
+    stream_key = stream_key.strip()
+    if ingest_protocol == "RTMPS (disarankan)":
+        output_url = f"rtmps://a.rtmps.youtube.com/live2/{stream_key}"
+    else:
+        output_url = f"rtmp://a.rtmp.youtube.com/live2/{stream_key}"
 
     if mode == "Re-stream Live YouTube":
         if not source_url:
@@ -131,6 +133,7 @@ def run_ffmpeg(mode, video_paths, audio_paths, source_url, stream_key, is_shorts
 
         log_callback("Mode: Re-stream Live YouTube")
         log_callback(f"Sumber: {source_url}")
+        log_callback(f"YouTube tujuan: {ingest_protocol}")
         try:
             direct_url = resolve_youtube_live_url(source_url, log_callback)
         except Exception as e:
@@ -466,7 +469,18 @@ def main():
             for i, path in enumerate(audio_paths, 1):
                 st.write(f"{i}. {Path(path).name}")
 
-    stream_key = st.text_input("Stream Key YouTube", type="password")
+    st.subheader("YouTube Tujuan")
+    stream_key = st.text_input(
+        "Stream Key YouTube",
+        type="password",
+        help="Ambil dari YouTube Studio → Go Live → Stream settings. Masukkan stream key, bukan URL channel.",
+    )
+    ingest_protocol = st.selectbox(
+        "Protokol YouTube",
+        ["RTMPS (disarankan)", "RTMP"],
+        index=0,
+        help="Jika RTMPS tidak tersambung pada server Anda, coba RTMP.",
+    )
     is_shorts = st.checkbox("Mode Shorts (720x1280)")
     loop_playlist = st.checkbox(
         "Ulangi playlist setelah video terakhir",
@@ -503,7 +517,7 @@ def main():
                 st.session_state["logs"] = []
                 thread = threading.Thread(
                     target=run_ffmpeg,
-                    args=(mode, selected_paths, audio_paths, source_url, stream_key, is_shorts, loop_playlist, log_callback),
+                    args=(mode, selected_paths, audio_paths, source_url, stream_key, ingest_protocol, is_shorts, loop_playlist, log_callback),
                     daemon=True,
                 )
                 thread.start()
