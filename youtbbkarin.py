@@ -69,26 +69,45 @@ def make_concat_playlist(video_paths):
 
 
 def resolve_youtube_live_url(source_url, log_callback):
-    """Resolve URL YouTube (watch/live) menjadi URL media langsung untuk FFmpeg."""
-    try:
-        result = subprocess.run(
-            [sys.executable, "-m", "yt_dlp", "-g", "-f", "best[height<=720]/best", source_url],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=True,
-        )
-        direct_url = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
-        if not direct_url:
-            raise RuntimeError("yt-dlp tidak menghasilkan URL media.")
-        return direct_url
-    except FileNotFoundError:
-        raise RuntimeError("Python/yt-dlp tidak tersedia di environment.")
-    except subprocess.CalledProcessError as e:
-        detail = (e.stderr or e.stdout or "").strip()[-1000:]
-        raise RuntimeError(f"Gagal mengambil stream YouTube: {detail}")
-    except Exception as e:
-        raise RuntimeError(str(e))
+    """Ambil URL media live yang bisa dibaca FFmpeg.
+
+    Untuk live YouTube, prioritaskan format HLS/muxed agar video dan audio
+    sumber tersedia dalam satu input. URL hasil yt-dlp bersifat sementara,
+    jadi fungsi ini dipanggil ulang jika FFmpeg gagal membuka sumber.
+    """
+    format_candidates = [
+        "best[protocol*=m3u8][height<=720]",
+        "best[protocol*=m3u8]",
+        "best[height<=720]",
+        "best",
+    ]
+    last_error = ""
+    for fmt in format_candidates:
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "yt_dlp", "--no-warnings", "-f", fmt, "-g", source_url],
+                capture_output=True,
+                text=True,
+                timeout=90,
+                check=True,
+            )
+            urls = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+            if urls:
+                # Jika yt-dlp memberi lebih dari satu URL (mis. video+audio),
+                # pilih URL pertama yang berupa manifest HLS atau URL muxed.
+                direct_url = next((u for u in urls if ".m3u8" in u.lower()), urls[0])
+                log_callback(f"Sumber live berhasil di-resolve ({fmt}).")
+                return direct_url
+        except subprocess.CalledProcessError as e:
+            last_error = (e.stderr or e.stdout or "").strip()[-1500:]
+        except Exception as e:
+            last_error = str(e)
+
+    raise RuntimeError(
+        "Gagal mengambil media live dari YouTube. "
+        + (last_error or "Format live tidak tersedia.")
+    )
+
 
 
 def make_audio_playlist(audio_paths):
@@ -119,8 +138,10 @@ def run_ffmpeg(mode, video_paths, audio_paths, source_url, stream_key, is_shorts
             return
 
         cmd = [
-            "ffmpeg", "-hide_banner", "-re",
-            "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+            "ffmpeg", "-hide_banner",
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "10",
             "-i", direct_url,
         ]
 
@@ -137,7 +158,7 @@ def run_ffmpeg(mode, video_paths, audio_paths, source_url, stream_key, is_shorts
             log_callback("Audio dari live sumber diganti dengan MP3 sendiri.")
         else:
             cmd += ["-map", "0:v:0", "-map", "0:a:0?"]
-            log_callback("Tidak ada MP3 sendiri: audio dari live sumber diteruskan.")
+            log_callback("Tidak ada MP3 sendiri: audio dari live sumber diteruskan jika tersedia.")
 
         cmd += [
             "-c:v", "libx264", "-preset", "veryfast",
